@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Healthcare Facilities – Islamabad & Rawalpindi</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    header { background: #0b6e4f; color: white; padding: 10px 16px; }
+    header h1 { margin: 0; font-size: 20px; }
+    header p { margin: 4px 0 0; font-size: 13px; }
+    #controls { padding: 8px 16px; background: #eef5f1; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    #controls input, #controls select { padding: 6px; }
+    #status { font-size: 13px; }
+    #status.error { color: #b00020; }
+    #map { height: calc(100vh - 160px); min-height: 350px; }
+    footer { padding: 6px 16px; font-size: 12px; background: #f4f4f4; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Healthcare Facilities Map</h1>
+  <p>Study area: Islamabad and Rawalpindi, Pakistan. Shows hospitals, clinics and pharmacies.</p>
+</header>
+
+<div id="controls">
+  <input id="search" type="text" placeholder="Search by name...">
+  <select id="filter">
+    <option value="all">All types</option>
+    <option value="hospital">Hospitals</option>
+    <option value="clinic">Clinics</option>
+    <option value="pharmacy">Pharmacies</option>
+  </select>
+  <span id="status">Loading data...</span>
+</div>
+
+<div id="map"></div>
+
+<footer>
+  Data source: OpenStreetMap via Overpass API (backup: Pakistan Health Facilities, HDX, CC0).
+  Map data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>.
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // 1. Create the map
+  const map = L.map("map").setView([33.65, 73.05], 11);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors"
+  }).addTo(map);
+
+  const markerLayer = L.layerGroup().addTo(map);
+  const statusEl = document.getElementById("status");
+  let facilities = [];   // all places, in one simple format
+
+  // 2. Overpass query (bounding box around Islamabad + Rawalpindi)
+  const query = `
+    [out:json][timeout:25];
+    nwr["amenity"~"^(hospital|clinic|pharmacy)$"](33.45,72.85,33.80,73.30);
+    out center tags;`;
+  const servers = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter"
+  ];
+
+  // 3. Fetch from the API (try each server in turn)
+  async function fetchFromOverpass() {
+    for (const url of servers) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "data=" + encodeURIComponent(query)
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const json = await res.json();
+        // Busy servers can reply "OK" with no data (and a "remark") - treat as failure
+        if (!json.elements || json.elements.length === 0) throw new Error("Empty result: " + (json.remark || ""));
+        return json.elements.map(el => {
+          const t = el.tags || {};
+          return {
+            name: t.name || "Unnamed",
+            type: t.amenity,
+            lat: el.lat || el.center.lat,
+            lng: el.lon || el.center.lon,
+            details: {
+              "Address": [t["addr:housenumber"], t["addr:street"], t["addr:suburb"], t["addr:city"]].filter(Boolean).join(", ") || t["addr:full"],
+              "Phone": t.phone || t["contact:phone"],
+              "Opening hours": t.opening_hours,
+              "Operator": t.operator,
+              "Ownership": t["operator:type"],
+              "Speciality": t["healthcare:speciality"],
+              "Emergency": t.emergency,
+              "Beds": t.beds,
+              "Website": t.website || t["contact:website"]
+            }
+          };
+        });
+      } catch (err) {
+        console.warn("Server failed:", url, err);
+      }
+    }
+    throw new Error("All Overpass servers failed");
+  }
+
+  // Backup: local GeoJSON file (hospitals only)
+  async function fetchFromFile() {
+    const res = await fetch("hospitals.geojson");
+    const json = await res.json();
+    return json.features.map(f => ({
+      name: f.properties.name,
+      type: "hospital",
+      lat: f.properties.lat,
+      lng: f.properties.lng,
+      details: {
+        "Sector": f.properties.sector,
+        "Category": f.properties.category,
+        "District": f.properties.district
+      }
+    }));
+  }
+
+  // 4. Draw markers (applies search + filter)
+  function showMarkers() {
+    markerLayer.clearLayers();
+    const text = document.getElementById("search").value.toLowerCase();
+    const type = document.getElementById("filter").value;
+
+    const shown = facilities.filter(f =>
+      (type === "all" || f.type === type) && f.name.toLowerCase().includes(text)
+    );
+
+    shown.forEach(f => {
+      // Build popup rows only for attributes that exist
+      let rows = "";
+      for (const [label, value] of Object.entries(f.details)) {
+        if (value) rows += `<br><b>${label}:</b> ${value}`;
+      }
+      if (!rows) rows = "<br><i>No more details in OpenStreetMap</i>";
+
+      L.marker([f.lat, f.lng])
+        .bindPopup(`<b>${f.name}</b><br>Type: ${f.type}${rows}`)
+        .addTo(markerLayer);
+    });
+    statusEl.textContent = shown.length + " places shown";
+  }
+
+  // 5. Load data with loading + error handling
+  async function loadData() {
+    try {
+      facilities = await fetchFromOverpass();
+    } catch (err) {
+      statusEl.textContent = "API failed. Showing backup hospital data.";
+      statusEl.className = "error";
+      try {
+        facilities = await fetchFromFile();
+      } catch (err2) {
+        statusEl.textContent = "Could not load any data. Please try again later.";
+        return;
+      }
+    }
+    showMarkers();
+  }
+
+  document.getElementById("search").addEventListener("input", showMarkers);
+  document.getElementById("filter").addEventListener("change", showMarkers);
+  loadData();
+</script>
+</body>
+</html>
